@@ -1,22 +1,15 @@
 """
-ANTI-OVERFITTING TRAINING SCRIPT
-=================================
-Complete training with all safeguards to prevent overfitting.
+FEW-SHOT LEARNING TRAINING SCRIPT
+==================================
+Trains Prototypical Network for palm vein classification.
 
-Safeguards:
-1. Early stopping when val loss increases
-2. Stop if val_acc stays 0% for N epochs
-3. Stop if train-val accuracy gap too large
-4. High dropout (0.5)
-5. Strong augmentation
-6. Label smoothing (0.2)
-7. Weight decay (0.01)
-8. Lightweight model
-9. Detailed logging
+Designed for: 1500 classes × 2 images per class
 
-Expected Results (1500 people × 2 images):
-- Classification: 55-65%
-- Verification: 82-88%
+Expected Results:
+- Episode Accuracy: 70-85% (30-way 1-shot)
+- Top-1 Full Eval: 35-50%
+- Top-5 Full Eval: 70-80%
+- Top-10 Full Eval: 82-90%
 """
 
 import os
@@ -27,67 +20,65 @@ import time
 import json
 import random
 
-# Set CPU threads BEFORE importing torch
-NUM_CPU_CORES = 16
-os.environ["OMP_NUM_THREADS"] = str(NUM_CPU_CORES)
-os.environ["MKL_NUM_THREADS"] = str(NUM_CPU_CORES)
-os.environ["NUMEXPR_NUM_THREADS"] = str(NUM_CPU_CORES)
-
-sys.path.insert(0, str(Path(__file__).parent))
+# Set CPU threads
+NUM_CPU_THREADS = 16
+os.environ["OMP_NUM_THREADS"] = str(NUM_CPU_THREADS)
+os.environ["MKL_NUM_THREADS"] = str(NUM_CPU_THREADS)
+os.environ["NUMEXPR_NUM_THREADS"] = str(NUM_CPU_THREADS)
 
 import torch
-torch.set_num_threads(NUM_CPU_CORES)
+torch.set_num_threads(NUM_CPU_THREADS)
 
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
 import numpy as np
 import logging
 
-# ============================================
+# ===========================================
 # CONFIGURATION
-# ============================================
+# ===========================================
 CONFIG = {
     # Paths
     'data_dir': 'final_folder',
-    'save_dir': 'models_v2',
-    'log_dir': 'logs_v2',
+    'save_dir': 'models_fewshot',
+    'log_dir': 'logs_fewshot',
+    
+    # Few-shot settings
+    'n_way': 30,              # Classes per episode
+    'k_shot': 1,              # Support samples per class
+    'q_query': 1,             # Query samples per class
     
     # Training
-    'epochs': 100,
-    'batch_size': 32,
-    'learning_rate': 0.001,
-    'weight_decay': 0.01,
-    'label_smoothing': 0.2,
+    'num_epochs': 200,
+    'episodes_per_epoch': 100,
+    'val_episodes': 50,
     
     # Model
-    'backbone': 'lightweight',  # 'lightweight' or 'efficientnet_b0'
-    'embedding_dim': 256,
-    'dropout': 0.5,
+    'backbone': 'custom',     # 'custom' or 'resnet18'
+    'embedding_dim': 128,
+    'dropout': 0.3,
+    'temperature': 0.5,
     
-    # Anti-overfitting
-    'early_stopping_patience': 15,
-    'overfit_check_epochs': 5,      # Stop if val_acc=0 for this many epochs
-    'max_train_val_gap': 30.0,      # Stop if train_acc - val_acc > this
-    
-    # Scheduler
-    'warmup_epochs': 5,
+    # Optimizer
+    'learning_rate': 0.001,
+    'weight_decay': 0.0001,
+    'warmup_epochs': 10,
     'min_lr': 1e-6,
     
+    # Early stopping
+    'patience': 30,
+    'min_delta': 0.1,
+    
     # Checkpointing
-    'save_every': 5,
+    'save_every': 10,
     
-    # Validation
-    'val_split': 0.2,
-    
-    # Device
+    # System
     'device': 'cpu',
-    'num_workers': 4,
-    
-    # Seed
-    'seed': 42
+    'seed': 42,
+    'val_split': 0.2,
+    'image_size': (112, 112),
 }
-# ============================================
+# ===========================================
 
 # Create directories
 Path(CONFIG['save_dir']).mkdir(parents=True, exist_ok=True)
@@ -110,227 +101,329 @@ progress_file = f"{CONFIG['log_dir']}/progress.txt"
 
 
 def set_seed(seed: int):
-    """Set random seed for reproducibility."""
+    """Set random seeds."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 
-def log_progress(epoch, epochs, train_loss, train_acc, val_loss, val_acc, 
-                 epoch_time, best_acc, status="TRAINING"):
-    """Write progress to file for quick checking."""
+def log_progress(
+    epoch: int,
+    total_epochs: int,
+    train_loss: float,
+    train_acc: float,
+    val_loss: float,
+    val_acc: float,
+    best_acc: float,
+    epoch_time: float,
+    status: str = "TRAINING"
+):
+    """Write progress to file."""
     with open(progress_file, 'w') as f:
         f.write("=" * 60 + "\n")
-        f.write("PALM VEIN TRAINING PROGRESS (Anti-Overfitting)\n")
+        f.write("FEW-SHOT PALM VEIN TRAINING\n")
         f.write(f"Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Status: {status}\n")
         f.write("=" * 60 + "\n\n")
         
         # Progress bar
-        progress = epoch / epochs
+        progress = epoch / total_epochs
         bar_len = 40
         filled = int(bar_len * progress)
         bar = '█' * filled + '░' * (bar_len - filled)
         f.write(f"Progress: [{bar}] {progress*100:.1f}%\n")
-        f.write(f"Epoch: {epoch}/{epochs}\n\n")
+        f.write(f"Epoch: {epoch}/{total_epochs}\n\n")
+        
+        # Episode settings
+        f.write(f"Episode: {CONFIG['n_way']}-way {CONFIG['k_shot']}-shot\n\n")
         
         # Metrics
-        f.write("Current Metrics:\n")
+        f.write("Current Metrics (Episode Accuracy):\n")
         f.write(f"  Train Loss: {train_loss:.4f}\n")
         f.write(f"  Train Acc:  {train_acc:.2f}%\n")
         f.write(f"  Val Loss:   {val_loss:.4f}\n")
         f.write(f"  Val Acc:    {val_acc:.2f}%\n\n")
         
-        # Overfitting check
-        gap = train_acc - val_acc
-        f.write("Overfitting Check:\n")
-        f.write(f"  Train-Val Gap: {gap:.2f}%")
-        if gap > CONFIG['max_train_val_gap']:
-            f.write(" ⚠️ HIGH\n")
-        elif gap > 15:
-            f.write(" ⚡ MODERATE\n")
-        else:
-            f.write(" ✓ OK\n")
-        f.write("\n")
-        
-        # Best and timing
         f.write(f"Best Val Accuracy: {best_acc:.2f}%\n")
         f.write(f"Epoch Time: {epoch_time:.1f} minutes\n")
-        remaining = (epochs - epoch) * epoch_time / 60
+        
+        remaining = (total_epochs - epoch) * epoch_time / 60
         f.write(f"Estimated Remaining: {remaining:.1f} hours\n")
+        f.write("=" * 60 + "\n")
+        
+        # Expected final results
+        f.write("\nExpected Final Results:\n")
+        f.write("  Episode Accuracy: 70-85%\n")
+        f.write("  Top-1 Classification: 35-50%\n")
+        f.write("  Top-5 Classification: 70-80%\n")
+        f.write("  Top-10 Classification: 82-90%\n")
         f.write("=" * 60 + "\n")
 
 
 class EarlyStopping:
-    """
-    Early stopping to prevent overfitting.
-    Stops training when validation loss doesn't improve.
-    """
+    """Early stopping handler."""
     
-    def __init__(self, patience: int = 15, min_delta: float = 0.001):
+    def __init__(self, patience: int = 30, min_delta: float = 0.1):
         self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
-        self.best_loss = None
+        self.best_score = None
         self.should_stop = False
     
-    def __call__(self, val_loss: float) -> bool:
-        if self.best_loss is None:
-            self.best_loss = val_loss
-        elif val_loss > self.best_loss - self.min_delta:
+    def __call__(self, score: float) -> bool:
+        if self.best_score is None:
+            self.best_score = score
+        elif score < self.best_score + self.min_delta:
             self.counter += 1
             if self.counter >= self.patience:
                 self.should_stop = True
         else:
-            self.best_loss = val_loss
+            self.best_score = score
             self.counter = 0
         
         return self.should_stop
 
 
-class OverfitDetector:
-    """
-    Detects overfitting and training problems.
-    """
+# Import modules
+from dataset import FewShotDataset, EpisodicSampler, create_data_loaders, Augmentation
+from model import PrototypicalNetwork, PrototypicalLoss
+
+
+def train_epoch(
+    model: nn.Module,
+    train_sampler: EpisodicSampler,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    device: str,
+    epoch: int
+) -> tuple:
+    """Train for one epoch (multiple episodes)."""
+    model.train()
     
-    def __init__(
-        self,
-        zero_val_patience: int = 5,
-        max_gap: float = 30.0
-    ):
-        self.zero_val_patience = zero_val_patience
-        self.max_gap = max_gap
-        self.zero_val_counter = 0
-        self.status = "OK"
-        self.message = ""
+    total_loss = 0.0
+    total_acc = 0.0
+    num_episodes = 0
     
-    def check(self, train_acc: float, val_acc: float) -> Tuple[bool, str]:
-        """
-        Check for overfitting or training problems.
+    for episode_idx, episode in enumerate(train_sampler):
+        # Move to device
+        support_rgb = episode['support_rgb'].to(device)
+        support_ir = episode['support_ir'].to(device)
+        support_labels = episode['support_labels'].to(device)
+        query_rgb = episode['query_rgb'].to(device)
+        query_ir = episode['query_ir'].to(device)
+        query_labels = episode['query_labels'].to(device)
         
-        Returns:
-            should_stop: True if training should stop
-            message: Reason for stopping
-        """
-        # Check for 0% validation accuracy
-        if val_acc < 0.1:  # Less than 0.1%
-            self.zero_val_counter += 1
-            if self.zero_val_counter >= self.zero_val_patience:
-                self.status = "FAILED"
-                self.message = f"Validation accuracy stayed near 0% for {self.zero_val_patience} epochs. Model not learning."
-                return True, self.message
+        # Forward pass
+        optimizer.zero_grad()
+        logits, _ = model(support_rgb, support_ir, support_labels, query_rgb, query_ir)
+        
+        # Compute loss
+        loss, metrics = criterion(logits, query_labels)
+        
+        # Backward pass
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        
+        total_loss += metrics['loss']
+        total_acc += metrics['accuracy']
+        num_episodes += 1
+        
+        # Log every 20 episodes
+        if (episode_idx + 1) % 20 == 0:
+            avg_loss = total_loss / num_episodes
+            avg_acc = total_acc / num_episodes
+            logger.info(f"Epoch {epoch} | Episode {episode_idx+1}/{len(train_sampler)} | "
+                       f"Loss: {avg_loss:.4f} | Acc: {avg_acc:.2f}%")
+    
+    return total_loss / num_episodes, total_acc / num_episodes
+
+
+def validate(
+    model: nn.Module,
+    val_sampler: EpisodicSampler,
+    criterion: nn.Module,
+    device: str
+) -> tuple:
+    """Validate on episodes."""
+    model.eval()
+    
+    total_loss = 0.0
+    total_acc = 0.0
+    num_episodes = 0
+    
+    with torch.no_grad():
+        for episode in val_sampler:
+            support_rgb = episode['support_rgb'].to(device)
+            support_ir = episode['support_ir'].to(device)
+            support_labels = episode['support_labels'].to(device)
+            query_rgb = episode['query_rgb'].to(device)
+            query_ir = episode['query_ir'].to(device)
+            query_labels = episode['query_labels'].to(device)
+            
+            logits, _ = model(support_rgb, support_ir, support_labels, query_rgb, query_ir)
+            loss, metrics = criterion(logits, query_labels)
+            
+            total_loss += metrics['loss']
+            total_acc += metrics['accuracy']
+            num_episodes += 1
+    
+    return total_loss / num_episodes, total_acc / num_episodes
+
+
+def evaluate_full(
+    model: nn.Module,
+    dataset: FewShotDataset,
+    device: str,
+    num_test: int = 200
+) -> dict:
+    """
+    Full evaluation: enroll all classes, test classification.
+    """
+    model.eval()
+    model.clear_prototypes()
+    
+    # Enroll all classes (use first sample as prototype)
+    logger.info("Enrolling all classes...")
+    for class_idx in dataset.classes:
+        sample = dataset.get_sample(class_idx, sample_idx=0)
+        rgb = sample['rgb'].unsqueeze(0).to(device)
+        ir = sample['ir'].unsqueeze(0).to(device)
+        model.enroll(class_idx, sample['name'], rgb, ir)
+    
+    logger.info(f"Enrolled {len(model.prototypes)} classes")
+    
+    # Test on random samples
+    top1_correct = 0
+    top5_correct = 0
+    top10_correct = 0
+    total = 0
+    
+    # Sample random test cases
+    test_samples = []
+    for class_idx in dataset.classes:
+        samples = dataset.class_to_samples[class_idx]
+        if len(samples) > 1:
+            # Use second sample for testing if available
+            test_samples.append((class_idx, 1))
         else:
-            self.zero_val_counter = 0
+            # Otherwise use same sample (will give biased results)
+            test_samples.append((class_idx, 0))
+    
+    random.shuffle(test_samples)
+    test_samples = test_samples[:num_test]
+    
+    for class_idx, sample_idx in test_samples:
+        sample = dataset.get_sample(class_idx, sample_idx)
+        rgb = sample['rgb'].unsqueeze(0).to(device)
+        ir = sample['ir'].unsqueeze(0).to(device)
         
-        # Check train-val gap
-        gap = train_acc - val_acc
-        if gap > self.max_gap and train_acc > 20:
-            self.status = "OVERFIT"
-            self.message = f"Train-Val gap ({gap:.1f}%) exceeds maximum ({self.max_gap}%). Severe overfitting."
-            return True, self.message
+        top_classes, top_scores = model.classify(rgb, ir, top_k=10)
+        top_classes = top_classes.tolist()
         
-        self.status = "OK"
-        self.message = ""
-        return False, ""
-
-
-from data.dataset import PalmVeinDataset, StrongAugmentation, create_dataloaders
-from models.networks import PalmVeinClassifier
-from models.losses import SimpleLoss
+        if top_classes[0] == class_idx:
+            top1_correct += 1
+        if class_idx in top_classes[:5]:
+            top5_correct += 1
+        if class_idx in top_classes[:10]:
+            top10_correct += 1
+        
+        total += 1
+    
+    results = {
+        'top1_accuracy': 100 * top1_correct / total if total > 0 else 0,
+        'top5_accuracy': 100 * top5_correct / total if total > 0 else 0,
+        'top10_accuracy': 100 * top10_correct / total if total > 0 else 0,
+        'total_tested': total,
+        'enrolled_classes': len(model.prototypes)
+    }
+    
+    return results
 
 
 def train():
-    """Main training function with all safeguards."""
-    
+    """Main training function."""
     start_time = datetime.now()
     set_seed(CONFIG['seed'])
     
     # Logging header
     logger.info("=" * 60)
-    logger.info("PALM VEIN TRAINING - ANTI-OVERFITTING VERSION")
+    logger.info("FEW-SHOT PALM VEIN CLASSIFICATION")
     logger.info("=" * 60)
     logger.info(f"Start Time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"Device: {CONFIG['device']}")
-    logger.info(f"CPU Cores: {NUM_CPU_CORES}")
     logger.info("")
     logger.info("Configuration:")
     for key, value in CONFIG.items():
         logger.info(f"  {key}: {value}")
     logger.info("=" * 60)
     
-    # Save config
     save_path = Path(CONFIG['save_dir'])
+    
+    # Save config
     with open(save_path / "config.json", 'w') as f:
         json.dump(CONFIG, f, indent=2)
     
-    # Create dataloaders
+    # Create data loaders
     logger.info("\nLoading dataset...")
-    train_loader, val_loader, dataset = create_dataloaders(
+    train_sampler, val_sampler, dataset = create_data_loaders(
         data_dir=CONFIG['data_dir'],
-        batch_size=CONFIG['batch_size'],
-        target_size=(224, 224),
+        n_way=CONFIG['n_way'],
+        k_shot=CONFIG['k_shot'],
+        q_query=CONFIG['q_query'],
+        train_episodes=CONFIG['episodes_per_epoch'],
+        val_episodes=CONFIG['val_episodes'],
+        image_size=CONFIG['image_size'],
         val_split=CONFIG['val_split'],
-        num_workers=CONFIG['num_workers'],
         seed=CONFIG['seed']
     )
     
-    num_classes = dataset.get_num_classes()
-    logger.info(f"Number of classes: {num_classes}")
-    logger.info(f"Training batches: {len(train_loader)}")
-    logger.info(f"Validation batches: {len(val_loader)}")
+    logger.info(f"Total classes: {dataset.get_num_classes()}")
+    logger.info(f"Train episodes per epoch: {len(train_sampler)}")
+    logger.info(f"Val episodes: {len(val_sampler)}")
     
     # Save metadata
     dataset.save_metadata(save_path / "dataset_metadata.json")
     
     # Create model
-    logger.info("\nCreating model...")
-    model = PalmVeinClassifier(
-        num_classes=num_classes,
+    logger.info("\nCreating Prototypical Network...")
+    model = PrototypicalNetwork(
+        embedding_dim=CONFIG['embedding_dim'],
+        dropout=CONFIG['dropout'],
         backbone=CONFIG['backbone'],
         pretrained=True,
-        embedding_dim=CONFIG['embedding_dim'],
-        dropout=CONFIG['dropout']
+        temperature=CONFIG['temperature']
     )
     model = model.to(CONFIG['device'])
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Total parameters: {total_params:,}")
-    logger.info(f"Trainable parameters: {trainable_params:,}")
     
-    # Loss function
-    criterion = SimpleLoss(
-        num_classes=num_classes,
-        label_smoothing=CONFIG['label_smoothing'],
-        use_focal=False
-    )
+    # Loss and optimizer
+    criterion = PrototypicalLoss(temperature=CONFIG['temperature'])
     
-    # Optimizer with weight decay
     optimizer = optim.AdamW(
         model.parameters(),
         lr=CONFIG['learning_rate'],
         weight_decay=CONFIG['weight_decay']
     )
     
-    # Learning rate scheduler with warmup
+    # Scheduler with warmup
     def lr_lambda(epoch):
         if epoch < CONFIG['warmup_epochs']:
             return (epoch + 1) / CONFIG['warmup_epochs']
         else:
-            progress = (epoch - CONFIG['warmup_epochs']) / (CONFIG['epochs'] - CONFIG['warmup_epochs'])
-            return max(CONFIG['min_lr'] / CONFIG['learning_rate'], 
+            progress = (epoch - CONFIG['warmup_epochs']) / (CONFIG['num_epochs'] - CONFIG['warmup_epochs'])
+            return max(CONFIG['min_lr'] / CONFIG['learning_rate'],
                       0.5 * (1 + np.cos(np.pi * progress)))
     
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
-    # Early stopping and overfit detection
-    early_stopping = EarlyStopping(patience=CONFIG['early_stopping_patience'])
-    overfit_detector = OverfitDetector(
-        zero_val_patience=CONFIG['overfit_check_epochs'],
-        max_gap=CONFIG['max_train_val_gap']
+    # Early stopping
+    early_stopping = EarlyStopping(
+        patience=CONFIG['patience'],
+        min_delta=CONFIG['min_delta']
     )
     
     # Training history
@@ -341,83 +434,25 @@ def train():
     }
     
     best_val_acc = 0.0
-    best_val_loss = float('inf')
     best_epoch = 0
     
     logger.info("\n" + "=" * 60)
     logger.info("STARTING TRAINING")
+    logger.info(f"Episode: {CONFIG['n_way']}-way {CONFIG['k_shot']}-shot")
     logger.info("=" * 60)
     
-    for epoch in range(CONFIG['epochs']):
+    for epoch in range(1, CONFIG['num_epochs'] + 1):
         epoch_start = time.time()
         
-        # ==================== TRAINING ====================
-        model.train()
-        train_loss = 0.0
-        train_correct = 0
-        train_total = 0
+        # Train
+        train_loss, train_acc = train_epoch(
+            model, train_sampler, criterion, optimizer, CONFIG['device'], epoch
+        )
         
-        for batch_idx, batch in enumerate(train_loader):
-            rgb = batch['rgb'].to(CONFIG['device'])
-            ir = batch['ir'].to(CONFIG['device'])
-            labels = batch['label'].to(CONFIG['device'])
-            
-            optimizer.zero_grad()
-            
-            # Forward pass
-            output = model(rgb, ir)
-            logits = output['logits']
-            embeddings = output['embeddings']
-            
-            # Compute loss
-            loss, loss_dict = criterion(logits, embeddings, labels)
-            
-            # Backward pass
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            
-            # Statistics
-            train_loss += loss.item() * rgb.size(0)
-            _, predicted = logits.max(1)
-            train_correct += predicted.eq(labels).sum().item()
-            train_total += labels.size(0)
-            
-            # Progress logging
-            if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == len(train_loader):
-                current_acc = 100. * train_correct / train_total
-                logger.info(f"Epoch {epoch+1}/{CONFIG['epochs']} | "
-                           f"Batch {batch_idx+1}/{len(train_loader)} | "
-                           f"Loss: {loss.item():.4f} | Acc: {current_acc:.2f}%")
-        
-        train_loss /= train_total
-        train_acc = 100. * train_correct / train_total
-        
-        # ==================== VALIDATION ====================
-        model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-        
-        with torch.no_grad():
-            for batch in val_loader:
-                rgb = batch['rgb'].to(CONFIG['device'])
-                ir = batch['ir'].to(CONFIG['device'])
-                labels = batch['label'].to(CONFIG['device'])
-                
-                output = model(rgb, ir)
-                logits = output['logits']
-                embeddings = output['embeddings']
-                
-                loss, _ = criterion(logits, embeddings, labels)
-                
-                val_loss += loss.item() * rgb.size(0)
-                _, predicted = logits.max(1)
-                val_correct += predicted.eq(labels).sum().item()
-                val_total += labels.size(0)
-        
-        val_loss /= val_total
-        val_acc = 100. * val_correct / val_total
+        # Validate
+        val_loss, val_acc = validate(
+            model, val_sampler, criterion, CONFIG['device']
+        )
         
         # Update scheduler
         scheduler.step()
@@ -434,129 +469,129 @@ def train():
         history['lr'].append(current_lr)
         history['epoch_time'].append(epoch_time)
         
-        # Calculate gap
-        gap = train_acc - val_acc
-        
         # Log epoch summary
         logger.info("")
         logger.info("=" * 60)
-        logger.info(f"EPOCH {epoch+1}/{CONFIG['epochs']} COMPLETED")
+        logger.info(f"EPOCH {epoch}/{CONFIG['num_epochs']} COMPLETED")
         logger.info("-" * 60)
         logger.info(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
         logger.info(f"  Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.2f}%")
-        logger.info(f"  Gap:        {gap:.2f}% | LR: {current_lr:.6f}")
-        logger.info(f"  Time:       {epoch_time:.1f} min")
-        logger.info(f"  Best:       {best_val_acc:.2f}% (Epoch {best_epoch})")
+        logger.info(f"  LR: {current_lr:.6f} | Time: {epoch_time:.1f} min")
+        logger.info(f"  Best: {best_val_acc:.2f}% (Epoch {best_epoch})")
         
-        # Remaining time
-        avg_time = np.mean(history['epoch_time'])
-        remaining = (CONFIG['epochs'] - epoch - 1) * avg_time / 60
-        logger.info(f"  Remaining:  {remaining:.1f} hours")
+        remaining = (CONFIG['num_epochs'] - epoch) * np.mean(history['epoch_time']) / 60
+        logger.info(f"  Remaining: {remaining:.1f} hours")
         logger.info("=" * 60)
         
         # Update progress file
-        log_progress(epoch+1, CONFIG['epochs'], train_loss, train_acc, 
-                    val_loss, val_acc, epoch_time, best_val_acc, "TRAINING")
+        log_progress(
+            epoch, CONFIG['num_epochs'],
+            train_loss, train_acc, val_loss, val_acc,
+            best_val_acc, epoch_time, "TRAINING"
+        )
         
-        # ==================== OVERFITTING CHECKS ====================
-        
-        # Check 1: Zero validation accuracy
-        should_stop, message = overfit_detector.check(train_acc, val_acc)
-        if should_stop:
-            logger.error("")
-            logger.error("!" * 60)
-            logger.error("TRAINING STOPPED - PROBLEM DETECTED")
-            logger.error(message)
-            logger.error("!" * 60)
-            log_progress(epoch+1, CONFIG['epochs'], train_loss, train_acc,
-                        val_loss, val_acc, epoch_time, best_val_acc, f"STOPPED: {overfit_detector.status}")
-            break
-        
-        # Check 2: Early stopping
-        if early_stopping(val_loss):
-            logger.warning("")
-            logger.warning("=" * 60)
-            logger.warning("EARLY STOPPING TRIGGERED")
-            logger.warning(f"Validation loss hasn't improved for {CONFIG['early_stopping_patience']} epochs")
-            logger.warning("=" * 60)
-            log_progress(epoch+1, CONFIG['epochs'], train_loss, train_acc,
-                        val_loss, val_acc, epoch_time, best_val_acc, "EARLY STOPPED")
-            break
-        
-        # ==================== SAVE BEST MODEL ====================
+        # Save best model
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            best_val_loss = val_loss
-            best_epoch = epoch + 1
+            best_epoch = epoch
             
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_acc': val_acc,
-                'val_loss': val_loss,
-                'train_acc': train_acc,
-                'train_loss': train_loss,
-                'num_classes': num_classes,
                 'config': CONFIG
             }, save_path / "best_model.pth")
             
-            logger.info(f"★★★ NEW BEST MODEL SAVED! Val Acc: {val_acc:.2f}% ★★★")
+            logger.info(f"★★★ NEW BEST MODEL! Val Acc: {val_acc:.2f}% ★★★")
         
         # Save checkpoint
-        if (epoch + 1) % CONFIG['save_every'] == 0:
+        if epoch % CONFIG['save_every'] == 0:
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
                 'val_acc': val_acc,
-                'num_classes': num_classes
-            }, save_path / f"checkpoint_epoch_{epoch+1}.pth")
-            logger.info(f"Checkpoint saved: checkpoint_epoch_{epoch+1}.pth")
+                'config': CONFIG
+            }, save_path / f"checkpoint_epoch_{epoch}.pth")
         
         # Save history
         with open(save_path / "history.json", 'w') as f:
             json.dump(history, f, indent=2)
+        
+        # Early stopping
+        if early_stopping(val_acc):
+            logger.warning(f"\nEarly stopping at epoch {epoch}")
+            break
     
-    # ==================== TRAINING COMPLETE ====================
-    end_time = datetime.now()
-    total_time = (end_time - start_time).total_seconds() / 3600
-    
-    # Save final model
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'num_classes': num_classes,
-        'config': CONFIG
-    }, save_path / "final_model.pth")
-    
-    logger.info("")
+    # Final evaluation
+    logger.info("\n" + "=" * 60)
+    logger.info("FINAL FULL EVALUATION")
     logger.info("=" * 60)
+    
+    # Load best model
+    checkpoint = torch.load(save_path / "best_model.pth", weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Full evaluation
+    eval_results = evaluate_full(model, dataset, CONFIG['device'], num_test=300)
+    
+    logger.info(f"Top-1 Accuracy:  {eval_results['top1_accuracy']:.2f}%")
+    logger.info(f"Top-5 Accuracy:  {eval_results['top5_accuracy']:.2f}%")
+    logger.info(f"Top-10 Accuracy: {eval_results['top10_accuracy']:.2f}%")
+    logger.info(f"Total tested: {eval_results['total_tested']}")
+    
+    # Save final results
+    final_results = {
+        'episode_accuracy': best_val_acc,
+        'top1_accuracy': eval_results['top1_accuracy'],
+        'top5_accuracy': eval_results['top5_accuracy'],
+        'top10_accuracy': eval_results['top10_accuracy'],
+        'best_epoch': best_epoch,
+        'total_epochs': epoch,
+        'config': CONFIG
+    }
+    
+    with open(save_path / "final_results.json", 'w') as f:
+        json.dump(final_results, f, indent=2)
+    
+    # Final summary
+    total_time = (datetime.now() - start_time).total_seconds() / 3600
+    
+    logger.info("\n" + "=" * 60)
     logger.info("TRAINING COMPLETED!")
     logger.info("=" * 60)
     logger.info(f"Total Time: {total_time:.2f} hours")
-    logger.info(f"Best Validation Accuracy: {best_val_acc:.2f}%")
+    logger.info(f"Best Episode Accuracy: {best_val_acc:.2f}%")
     logger.info(f"Best Epoch: {best_epoch}")
-    logger.info(f"Final Train Acc: {train_acc:.2f}%")
-    logger.info(f"Final Val Acc: {val_acc:.2f}%")
-    logger.info(f"Models saved in: {save_path}")
+    logger.info("-" * 60)
+    logger.info("FINAL CLASSIFICATION ACCURACY:")
+    logger.info(f"  Top-1:  {eval_results['top1_accuracy']:.2f}%")
+    logger.info(f"  Top-5:  {eval_results['top5_accuracy']:.2f}%")
+    logger.info(f"  Top-10: {eval_results['top10_accuracy']:.2f}%")
     logger.info("=" * 60)
     
-    # Final progress update
-    log_progress(epoch+1, CONFIG['epochs'], train_loss, train_acc,
-                val_loss, val_acc, epoch_time, best_val_acc, "COMPLETED")
+    # Update progress file
+    log_progress(
+        epoch, CONFIG['num_epochs'],
+        train_loss, train_acc, val_loss, val_acc,
+        best_val_acc, epoch_time, "COMPLETED"
+    )
     
-    return best_val_acc
+    return final_results
 
 
 if __name__ == "__main__":
-    from typing import Tuple
-    
     try:
-        best_acc = train()
-        logger.info(f"\nFinal best accuracy: {best_acc:.2f}%")
+        results = train()
+        print("\n" + "=" * 60)
+        print("FINAL RESULTS SUMMARY")
+        print("=" * 60)
+        print(f"Top-1:  {results['top1_accuracy']:.2f}%")
+        print(f"Top-5:  {results['top5_accuracy']:.2f}%")
+        print(f"Top-10: {results['top10_accuracy']:.2f}%")
+        print("=" * 60)
     except KeyboardInterrupt:
-        logger.warning("\n*** Training interrupted by user ***")
+        logger.warning("\n*** Training interrupted ***")
     except Exception as e:
         logger.error(f"\n*** Training failed: {e} ***")
         import traceback
